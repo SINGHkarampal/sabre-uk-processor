@@ -1,0 +1,3 @@
+# processing.py is stdlib-only (re, json, datetime, collections, http.server) —
+# no PDF libraries, no CSV libraries, no third-party dependencies at all.
+# This file exists so Vercel recognizes this as a Python project.
