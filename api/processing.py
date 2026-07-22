@@ -454,6 +454,78 @@ def _fmt_seg_line(seg: dict) -> str:
     return f"{air}{fno} {d_h} {o} {dt} → {d} {at} ({seat})".strip()
 
 
+def _format_plain_description_date(seg: dict) -> str:
+    """Return dates such as '6th Jul 2026' for the plain-text description."""
+    raw = str(seg.get("departure_date") or "").strip().upper()
+    if not raw:
+        return ""
+
+    # Preserve an explicitly supplied ISO year.
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        try:
+            dt = datetime.datetime.strptime(raw, "%Y-%m-%d")
+            return f"{_ordinal(dt.day)} {dt.strftime('%b')} {dt.year}"
+        except Exception:
+            return raw
+
+    # Sabre segment lines normally contain DDMMM but no year. The original
+    # desktop formatter used the processing year, so retain that behaviour.
+    if re.match(r"^\d{2}[A-Z]{3}$", raw):
+        try:
+            day = int(raw[:2])
+            month = raw[2:5].title()
+            explicit_year = seg.get("departure_year") or seg.get("year")
+            year = int(explicit_year) if explicit_year else _today_london_date().year
+            return f"{_ordinal(day)} {month} {year}"
+        except Exception:
+            return raw
+
+    return raw
+
+
+def _format_plain_description_time(value: str) -> str:
+    """Return a time as HH:MM, accepting HHMM or an already-normalised value."""
+    if not value:
+        return ""
+    normalised, _ = _normalize_time_24h(str(value))
+    if re.match(r"^\d{2}:\d{2}$", normalised or ""):
+        return normalised
+    s = str(value).strip()
+    if re.match(r"^\d{4}$", s):
+        return f"{s[:2]}:{s[2:]}"
+    return s
+
+
+def _plain_cabin_class(seg: dict) -> str:
+    """Use the original generic Smap for every airline, with no overrides."""
+    seat = (seg.get("seat_class") or seg.get("class") or "")[:1].upper()
+    label = _nice_cabin(seat)
+    if not label or label == "N/A":
+        return "N/A"
+    return label if label.endswith("Class") else f"{label} Class"
+
+
+def _fmt_plain_segment_line(seg: dict) -> str:
+    """Build the exact non-HTML segment line stored in Zoho."""
+    air = (seg.get("airline") or "").strip().upper()
+    flight_number = str(seg.get("flight_number") or "").strip()
+    origin = (seg.get("from") or seg.get("origin") or "").strip().upper()
+    destination = (seg.get("to") or seg.get("destination") or "").strip().upper()
+    airline_ref = str(seg.get("airline_ref") or "N/A").strip()
+    departure_time = _format_plain_description_time(
+        seg.get("departure_time_24h") or seg.get("departure_time") or seg.get("dep_time") or ""
+    )
+    arrival_time = _format_plain_description_time(
+        seg.get("arrival_time_24h") or seg.get("arrival_time") or seg.get("arr_time") or ""
+    )
+    date_text = _format_plain_description_date(seg)
+    cabin = _plain_cabin_class(seg)
+    return (
+        f"{date_text} | {air}{flight_number} {origin} - {destination} "
+        f"(Airline ref : {airline_ref}) | {departure_time} {arrival_time} | {cabin}"
+    ).strip()
+
+
 # ================= mapping: enquiry details / names liststring =================
 
 def generate_enquiry_details(parsed_data):
@@ -544,6 +616,17 @@ def build_segments_description_associated_only(data: dict) -> str:
 # as a {{STOCK:<IATA>}} placeholder token for local code to substitute.
 
 def prepare_associated_products(data):
+    """Create grouped Associated Products with an always-plain-text description.
+
+    Exact output shape:
+        Passengers:
+        Passenger Name Etikt No. : ({{STOCK:XX}}-1234567890)
+
+        Segments:
+        6th Jul 2026 | XX123 AAA - BBB (Airline ref : ABC123) | 10:45 13:15 | Business Class
+
+    No HTML tags are emitted by this function.
+    """
     associated_products = []
 
     provider = (data['remarks'].get('Provider', 'Unknown Provider') or '').upper().strip()
@@ -589,11 +672,12 @@ def prepare_associated_products(data):
         return airline in acc_airlines if airline else True
 
     associated_only = [s for s in sorted(segments, key=seg_order) if _is_associated(s)]
-    seg_lines_all = [_fmt_seg_line(s) for s in associated_only]
-    all_segments_block = "\n".join(seg_lines_all)
+    all_segments_block = "\n".join(_fmt_plain_segment_line(s) for s in associated_only)
 
-    ref_to_name = {p.get("passenger_ref"): f"{(p.get('firstname') or '').strip().title()} {(p.get('lastname') or '').strip().title()}".strip()
-                   for p in data.get("names_section", [])}
+    ref_to_name = {
+        p.get("passenger_ref"): f"{(p.get('firstname') or '').strip().title()} {(p.get('lastname') or '').strip().title()}".strip()
+        for p in data.get("names_section", [])
+    }
 
     rows = []
     for entry in data.get("accounting", []):
@@ -613,10 +697,7 @@ def prepare_associated_products(data):
         air = (entry.get("airline", "") or "").strip().upper()
         etkt = (entry.get("eticket") or "").strip()
         stock_placeholder = f"{{{{STOCK:{air}}}}}" if air else air
-        # Keep the Vercel payload compatible with the original Zoho rich-text
-        # accounting layout.  The stock code is still resolved locally after
-        # this response comes back.
-        ticket_text = f"Etiket No. : {stock_placeholder}-{etkt}" if etkt else ""
+        label = pax_name + (f" Etikt No. : ({stock_placeholder}-{etkt})" if etkt else "")
 
         payment_method = entry.get("payment", "")
         original_currency = None
@@ -627,7 +708,7 @@ def prepare_associated_products(data):
             card_used = "Bank Transfer"
         elif payment_method == "CC":
             extra_info = (entry.get("extra_info", "") or "").replace(" ", "")
-            card_used = (extra_info[:2] + " " + (extra_info.strip())[-4:]) if extra_info else ""
+            card_used = (extra_info[:2] + " " + extra_info[-4:]) if extra_info else ""
             two = card_used[:2]
             if two == "AX":
                 last_four = card_used[-4:]
@@ -653,8 +734,7 @@ def prepare_associated_products(data):
             pt += " (USD)"
 
         rows.append({
-            "pax_name": pax_name,
-            "ticket_text": ticket_text,
+            "label": label,
             "buy": buy,
             "currency": original_currency,
             "payment_type": pt or "Bank Transfer",
@@ -663,38 +743,21 @@ def prepare_associated_products(data):
     groups = defaultdict(lambda: {"passengers": [], "sum_buy": 0.0, "sum_fx": 0.0})
 
     base = (provider, all_segments_block)
-    for r in rows:
-        cur = r["currency"] or "GBP"
-        key = base + (cur, r["payment_type"])
-        g = groups[key]
-        g["passengers"].append({
-            "pax_name": r["pax_name"],
-            "ticket_text": r["ticket_text"],
-        })
-        if r["currency"] is None:
-            g["sum_buy"] += float(r["buy"] or 0.0)
+    for row in rows:
+        cur = row["currency"] or "GBP"
+        key = base + (cur, row["payment_type"])
+        group = groups[key]
+        group["passengers"].append(row["label"])
+        if row["currency"] is None:
+            group["sum_buy"] += float(row["buy"] or 0.0)
         else:
-            g["sum_fx"] += float(r["buy"] or 0.0)
+            group["sum_fx"] += float(row["buy"] or 0.0)
 
     today = datetime.datetime.now().strftime("%Y-%m-%d")
-    for key, g in groups.items():
+    for key, group in groups.items():
         _, seg_block, cur, payment_type = key
-
-        # Restore the original Zoho rich-text appearance:
-        #   centred passenger name
-        #   one <div> per associated flight segment
-        #   centred e-ticket line
-        # Multiple passengers in the same grouped accounting row are separated
-        # by one blank rich-text line, while buy/FX totals remain grouped.
-        seg_lines = [ln.strip() for ln in (seg_block or "").splitlines() if ln.strip()]
-        passenger_blocks = []
-        for passenger in g["passengers"]:
-            top = f"<div style='text-align:center'>{passenger['pax_name']}</div>"
-            middle = "".join(f"<div>{ln}</div>" for ln in seg_lines)
-            bottom_text = passenger.get("ticket_text") or ""
-            bottom = f"<div style='text-align:center'>{bottom_text}</div>" if bottom_text else ""
-            passenger_blocks.append(f"{top}{middle}{bottom}")
-        description = "<div><br></div>".join(passenger_blocks)
+        passenger_lines = "\n".join(group["passengers"])
+        description = f"Passengers:\n{passenger_lines}\n\nSegments:\n{seg_block}"
 
         out = {
             "provider_code": provider,
@@ -703,13 +766,13 @@ def prepare_associated_products(data):
             "other_payment_type_used": [payment_type],
         }
         if cur == "GBP":
-            out["buy"] = round(g["sum_buy"], 2)
+            out["buy"] = round(group["sum_buy"], 2)
             out["original_payment_currency"] = None
             out["foreign_currency_amount"] = "0"
         else:
             out["buy"] = None
             out["original_payment_currency"] = cur
-            out["foreign_currency_amount"] = str(round(g["sum_fx"], 2))
+            out["foreign_currency_amount"] = str(round(group["sum_fx"], 2))
 
         associated_products.append(out)
 
