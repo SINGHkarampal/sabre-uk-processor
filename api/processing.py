@@ -613,7 +613,10 @@ def prepare_associated_products(data):
         air = (entry.get("airline", "") or "").strip().upper()
         etkt = (entry.get("eticket") or "").strip()
         stock_placeholder = f"{{{{STOCK:{air}}}}}" if air else air
-        label = pax_name + (f" Etikt No. : ({stock_placeholder}" + "-" + f"{etkt})" if etkt else "")
+        # Keep the Vercel payload compatible with the original Zoho rich-text
+        # accounting layout.  The stock code is still resolved locally after
+        # this response comes back.
+        ticket_text = f"Etiket No. : {stock_placeholder}-{etkt}" if etkt else ""
 
         payment_method = entry.get("payment", "")
         original_currency = None
@@ -650,7 +653,8 @@ def prepare_associated_products(data):
             pt += " (USD)"
 
         rows.append({
-            "label": label,
+            "pax_name": pax_name,
+            "ticket_text": ticket_text,
             "buy": buy,
             "currency": original_currency,
             "payment_type": pt or "Bank Transfer",
@@ -663,7 +667,10 @@ def prepare_associated_products(data):
         cur = r["currency"] or "GBP"
         key = base + (cur, r["payment_type"])
         g = groups[key]
-        g["passengers"].append(r["label"])
+        g["passengers"].append({
+            "pax_name": r["pax_name"],
+            "ticket_text": r["ticket_text"],
+        })
         if r["currency"] is None:
             g["sum_buy"] += float(r["buy"] or 0.0)
         else:
@@ -672,8 +679,22 @@ def prepare_associated_products(data):
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     for key, g in groups.items():
         _, seg_block, cur, payment_type = key
-        pax_lines = "\n".join(g["passengers"])
-        description = f"Passengers:\n{pax_lines}\n\nSegments:\n{seg_block}"
+
+        # Restore the original Zoho rich-text appearance:
+        #   centred passenger name
+        #   one <div> per associated flight segment
+        #   centred e-ticket line
+        # Multiple passengers in the same grouped accounting row are separated
+        # by one blank rich-text line, while buy/FX totals remain grouped.
+        seg_lines = [ln.strip() for ln in (seg_block or "").splitlines() if ln.strip()]
+        passenger_blocks = []
+        for passenger in g["passengers"]:
+            top = f"<div style='text-align:center'>{passenger['pax_name']}</div>"
+            middle = "".join(f"<div>{ln}</div>" for ln in seg_lines)
+            bottom_text = passenger.get("ticket_text") or ""
+            bottom = f"<div style='text-align:center'>{bottom_text}</div>" if bottom_text else ""
+            passenger_blocks.append(f"{top}{middle}{bottom}")
+        description = "<div><br></div>".join(passenger_blocks)
 
         out = {
             "provider_code": provider,
